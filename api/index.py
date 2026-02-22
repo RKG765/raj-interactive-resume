@@ -1,16 +1,15 @@
 """
 FastAPI backend for the Raj Kumar portfolio.
-Handles terminal commands and Groq AI chat proxy.
+Handles terminal commands, GitHub project fetching, and Groq AI chat proxy.
 Deployed as a Vercel serverless function.
 """
 
 import os
-import json
+import time
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import httpx
 
@@ -24,15 +23,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Pydantic Models ──────────────────────────────────────────
+# ── Config ───────────────────────────────────────────────
+GITHUB_USERNAME = os.environ.get("GITHUB_USERNAME", "RKG765")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+CACHE_TTL = 600  # 10 minutes
 
-class CommandRequest(BaseModel):
-    command: str
+# ── In-Memory Cache ─────────────────────────────────────
+_projects_cache: dict = {"data": None, "timestamp": 0}
 
-class CommandResponse(BaseModel):
-    type: str  # "text" | "error" | "chat_init"
-    content: str
-    style: Optional[str] = None  # "bio" | "project" | "notes" | "log"
+
+# ── Pydantic Models ─────────────────────────────────────
 
 class ChatRequest(BaseModel):
     message: str
@@ -41,294 +42,97 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     reply: str
 
-# ── Command Data ─────────────────────────────────────────────
 
-WHOAMI = """
-╔══════════════════════════════════════════════════════════════╗
-║                                                              ║
-║   ██████╗   █████╗      ██╗    ██╗  ██╗██╗   ██╗███╗   ███╗ ║
-║   ██╔══██╗ ██╔══██╗     ██║    ██║ ██╔╝██║   ██║████╗ ████║ ║
-║   ██████╔╝ ███████║     ██║    █████╔╝ ██║   ██║██╔████╔██║ ║
-║   ██╔══██╗ ██╔══██║██   ██║    ██╔═██╗ ██║   ██║██║╚██╔╝██║ ║
-║   ██║  ██║ ██║  ██║╚█████╔╝    ██║  ██╗╚██████╔╝██║ ╚═╝ ██║ ║
-║   ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚════╝     ╚═╝  ╚═╝ ╚═════╝ ╚═╝     ╚═╝ ║
-║                                                              ║
-╠══════════════════════════════════════════════════════════════╣
-║  Name     : Raj Kumar                                        ║
-║  Role     : Full-Stack Developer & Systems Thinker           ║
-║  College  : B.Tech CSE @ BML Munjal University               ║
-║  Focus    : Backend Systems, DevOps, AI/ML Pipelines         ║
-║                                                              ║
-║  Philosophy:                                                  ║
-║  > "Learning for the purpose of learning."                    ║
-║  > I build tools to understand how they work — from           ║
-║  > version control internals to AI security gateways.         ║
-║                                                              ║
-║  Stack    : Python · FastAPI · SvelteKit · Docker · AWS      ║
-║  Contact  : github.com/rajkumar                              ║
-╚══════════════════════════════════════════════════════════════╝
-"""
+# ── /api/projects — Cached GitHub Repos ─────────────────
 
-PYGIT_MD = """
-┌─────────────────────────────────────────────────────┐
-│            📄  cat pygit.md                         │
-│         PyGit — A Python Version Control System     │
-└─────────────────────────────────────────────────────┘
+@app.get("/api/projects")
+async def get_projects():
+    """
+    Fetch featured GitHub repos with caching.
+    Filters: no forks, no archived, sorted by recent update.
+    Returns normalized project data.
+    """
+    now = time.time()
 
-## Overview
-A from-scratch implementation of Git's core internals in
-pure Python. Built to deeply understand content-addressable
-storage, DAG-based history, and diff algorithms.
+    # Serve from cache if fresh
+    if _projects_cache["data"] and (now - _projects_cache["timestamp"]) < CACHE_TTL:
+        return {"projects": _projects_cache["data"], "cached": True}
 
-## Architecture
+    # Fetch from GitHub API
+    headers = {"Accept": "application/vnd.github.v3+json"}
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
 
-  ┌──────────────┐     ┌──────────────┐
-  │  Working Dir │────▶│  Staging Area│
-  │  (files)     │ add │  (index)     │
-  └──────────────┘     └──────┬───────┘
-                              │ commit
-                       ┌──────▼───────┐
-                       │  Object Store │
-                       │  (SHA-1 blobs,│
-                       │   trees,      │
-                       │   commits)    │
-                       └──────┬───────┘
-                              │
-                       ┌──────▼───────┐
-                       │   Refs/HEAD   │
-                       │   (branches)  │
-                       └──────────────┘
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"https://api.github.com/users/{GITHUB_USERNAME}/repos",
+                params={
+                    "sort": "updated",
+                    "direction": "desc",
+                    "per_page": 30,
+                    "type": "owner",
+                },
+                headers=headers,
+            )
+            resp.raise_for_status()
+            repos = resp.json()
 
-## Core Components
-  • Blob Store    → SHA-1 hashed, zlib-compressed file storage
-  • Tree Objects  → Directory structure snapshots
-  • Commit Graph  → DAG linking parent commits
-  • Index File    → Binary staging area format
-  • Diff Engine   → Myers diff algorithm implementation
-  • Merge Engine  → Three-way merge with conflict detection
-  • Branch/Tag    → Symbolic references to commit SHAs
+        # Filter: no forks, no archived
+        filtered = [r for r in repos if not r.get("fork") and not r.get("archived")]
 
-## Commands Implemented
-  pygit init       → Initialize .pygit repository
-  pygit add <file> → Stage file changes
-  pygit commit -m  → Create commit object
-  pygit log        → Walk commit DAG
-  pygit diff       → Myers diff between working/staging
-  pygit branch     → Create/list branches
-  pygit merge      → Three-way merge with conflict markers
+        # Normalize to clean project objects
+        projects = []
+        for repo in filtered[:10]:
+            tech = []
+            # Primary language
+            if repo.get("language"):
+                tech.append(repo["language"])
+            # Topics as additional tech
+            for topic in repo.get("topics", []):
+                if topic not in [t.lower() for t in tech]:
+                    tech.append(topic)
 
-## Key Learnings
-  → Content-addressable storage is elegant & powerful
-  → The index file format is surprisingly complex
-  → Three-way merge requires careful ancestor resolution
-  → Building Git taught more than using Git ever could
+            projects.append({
+                "name": repo.get("name", ""),
+                "description": (repo.get("description") or "No description")[:120],
+                "tech": tech[:5],
+                "stars": repo.get("stargazers_count", 0),
+                "url": repo.get("html_url", ""),
+                "updated": repo.get("updated_at", ""),
+                "homepage": repo.get("homepage") or "",
+            })
 
-  Status: ✅ Fully functional | 2,400+ lines of Python
-"""
+        # Update cache
+        _projects_cache["data"] = projects
+        _projects_cache["timestamp"] = now
 
-JOB_SCRAPER_LOG = """
-[2026-02-22 10:00:01] ▶ BOOT  job_scraper v2.1.0
-[2026-02-22 10:00:01] ✓ Loading environment... OK
-[2026-02-22 10:00:01] ✓ Connecting to PostgreSQL... OK
-[2026-02-22 10:00:02] ✓ Redis cache connected... OK
-[2026-02-22 10:00:02] ▶ INIT  Scrapy engine starting
+        return {"projects": projects, "cached": False}
 
-┌─────────────────────────────────────────────────────┐
-│        🕷️  Job Scraper — Architecture Overview       │
-└─────────────────────────────────────────────────────┘
+    except Exception as e:
+        # If cache exists but expired, serve stale
+        if _projects_cache["data"]:
+            return {"projects": _projects_cache["data"], "cached": True, "stale": True}
 
-  ┌───────────┐   ┌───────────┐   ┌──────────────┐
-  │  Scrapy   │──▶│  FastAPI   │──▶│  PostgreSQL  │
-  │  Spiders  │   │  REST API  │   │   Database   │
-  └───────────┘   └─────┬─────┘   └──────────────┘
-                        │
-                  ┌─────▼─────┐
-                  │  Razorpay  │
-                  │  Payments  │
-                  └───────────┘
+        return {"projects": [], "error": str(e)}
 
-[2026-02-22 10:00:03] ▶ CRAWL spider=linkedin_jobs
-[2026-02-22 10:00:04] ✓ Scraped 142 listings from LinkedIn
-[2026-02-22 10:00:05] ▶ CRAWL spider=indeed_jobs
-[2026-02-22 10:00:06] ✓ Scraped 98 listings from Indeed
-[2026-02-22 10:00:07] ▶ DEDUP  Running deduplication pipeline
-[2026-02-22 10:00:07] ✓ Removed 23 duplicates (fuzzy match)
-[2026-02-22 10:00:08] ▶ STORE Inserting 217 jobs into PostgreSQL
-[2026-02-22 10:00:08] ✓ Bulk insert complete
-[2026-02-22 10:00:09] ▶ API   Exposing endpoints:
-                        GET  /api/jobs?q=python&loc=delhi
-                        GET  /api/jobs/:id
-                        POST /api/subscribe  (Razorpay)
-[2026-02-22 10:00:09] ▶ PAY   Razorpay webhook listener active
-[2026-02-22 10:00:10] ✓ All systems operational
 
-  Tech Stack:
-  • Scrapy       → Async web crawlers with rotating proxies
-  • FastAPI      → REST API with Pydantic validation
-  • PostgreSQL   → Relational storage with full-text search
-  • Redis        → Caching layer & rate limiting
-  • Razorpay     → Subscription billing integration
-  • Celery       → Scheduled scraping with beat scheduler
-
-[2026-02-22 10:00:10] ✓ READY Listening on port 8000
-"""
-
-LLD_NOTES = """
-┌─────────────────────────────────────────────────────┐
-│      📖  Low-Level Design & SOLID Principles        │
-│              Study Notes — C++ & Python              │
-└─────────────────────────────────────────────────────┘
-
-━━━ SOLID PRINCIPLES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-  [S] Single Responsibility
-      → A class should have only ONE reason to change
-      → Example: Separate Logger from BusinessLogic
-
-  [O] Open/Closed
-      → Open for extension, closed for modification
-      → Use abstract base classes & polymorphism
-
-  [L] Liskov Substitution
-      → Subtypes must be substitutable for base types
-      → Rectangle/Square problem is the classic gotcha
-
-  [I] Interface Segregation
-      → Many client-specific interfaces > one general
-      → Don't force classes to implement unused methods
-
-  [D] Dependency Inversion
-      → Depend on abstractions, not concretions
-      → Inject dependencies via constructors
-
-━━━ KEY DESIGN PATTERNS (C++) ━━━━━━━━━━━━━━━━━━━━━━━
-
-  ┌────────────────┬────────────────────────────────┐
-  │ Pattern        │ Use Case                       │
-  ├────────────────┼────────────────────────────────┤
-  │ Singleton      │ Config manager, DB connection   │
-  │ Factory        │ Object creation abstraction     │
-  │ Observer       │ Event-driven systems            │
-  │ Strategy       │ Swappable algorithms at runtime │
-  │ Builder        │ Complex object construction     │
-  │ Adapter        │ Legacy system integration       │
-  │ Decorator      │ Runtime behavior extension      │
-  └────────────────┴────────────────────────────────┘
-
-━━━ LLD CASE STUDIES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-  1. Parking Lot System
-     → Vehicle hierarchy (Car, Truck, Motorcycle)
-     → ParkingSpot with strategy pattern for pricing
-     → Observer pattern for availability updates
-
-  2. Library Management
-     → Book, Member, Librarian entities
-     → State pattern for book status transitions
-     → Command pattern for undo/redo operations
-
-  3. Elevator System
-     → State machine for elevator states
-     → Strategy for scheduling (SCAN, LOOK, SSTF)
-     → Observer for floor request notifications
-
-━━━ C++ ESSENTIALS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-  • Smart Pointers   → unique_ptr, shared_ptr, weak_ptr
-  • Move Semantics   → std::move, rvalue references
-  • RAII             → Resource management via scope
-  • Virtual Dispatch → vtable, pure virtual functions
-  • Templates        → Generic programming & SFINAE
-  • STL Containers   → vector, map, unordered_map, set
-
-  Status: 📚 Continuously updated | 50+ problems solved
-"""
-
-COMMANDS = {
-    "whoami": ("bio", WHOAMI),
-    "cat pygit.md": ("project", PYGIT_MD),
-    "run job_scraper": ("log", JOB_SCRAPER_LOG),
-    "view lld_notes": ("notes", LLD_NOTES),
-}
-
-# ── Routes ───────────────────────────────────────────
-
-@app.post("/api/commands", response_model=CommandResponse)
-async def handle_command(req: CommandRequest):
-    cmd = req.command.strip().lower()
-
-    if cmd == "help":
-        return CommandResponse(
-            type="text",
-            style="notes",
-            content="""
-Available commands:
-  whoami           → About Raj Kumar
-  cat pygit.md     → PyGit version control system
-  run job_scraper  → Job aggregator architecture
-  view lld_notes   → LLD & SOLID principles notes
-  ssh ai_gateway   → Interactive AI chat session
-  help             → Show this help message
-  clear            → Clear terminal screen
-"""
-        )
-
-    if cmd == "ssh ai_gateway":
-        return CommandResponse(
-            type="chat_init",
-            style="bio",
-            content="""
-╔══════════════════════════════════════════════════════╗
-║  🔐 Connecting to AI Gateway...                      ║
-║  ✓ SSH tunnel established                            ║
-║  ✓ Authentication successful                         ║
-║                                                      ║
-║  Welcome to the Secure AI Gateway                    ║
-║  Built with FastAPI + Groq LLaMA integration         ║
-║                                                      ║
-║  This gateway was built to understand:               ║
-║  • AI middleware architecture                        ║
-║  • Prompt injection defense                          ║
-║  • API key rotation & rate limiting                  ║
-║  • Streaming LLM response proxying                   ║
-║                                                      ║
-║  Type your message. Type 'exit' to disconnect.       ║
-╚══════════════════════════════════════════════════════╝
-"""
-        )
-
-    if cmd in COMMANDS:
-        style, content = COMMANDS[cmd]
-        return CommandResponse(type="text", style=style, content=content)
-
-    return CommandResponse(
-        type="error",
-        content=f"Command not found: {cmd}\nType 'help' for available commands."
-    )
-
+# ── /api/chat — Groq LLaMA Chat Proxy ──────────────────
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat_proxy(req: ChatRequest):
     """Proxy chat messages to Groq API (LLaMA 3)."""
-    groq_key = os.environ.get("GROQ_API_KEY", "")
-
-    if not groq_key:
+    if not GROQ_API_KEY:
         return ChatResponse(
             reply="⚠️  GROQ_API_KEY not configured.\n"
-                  "The AI Gateway demo requires a Groq API key.\n"
-                  "Set it as an environment variable to enable this feature.\n\n"
-                  "Architecture Note:\n"
-                  "In production, this endpoint acts as a secure proxy —\n"
-                  "sanitizing prompts, enforcing rate limits, and streaming\n"
-                  "responses from LLaMA 3 via the Groq inference API."
+                  "The AI chat feature requires a Groq API key."
         )
 
     system_prompt = (
-        "You are the AI assistant inside Raj Kumar's portfolio. "
-        "You are running on a Secure AI Gateway built with FastAPI. "
+        "You are the AI assistant inside Raj Kumar's portfolio terminal. "
         "Raj is a B.Tech CSE student at BML Munjal University who builds "
         "backend systems, DevOps pipelines, and AI/ML tools. "
-        "Keep responses concise and technical. Use terminal-style formatting."
+        "Keep responses concise and technical."
     )
 
     messages = [{"role": "system", "content": system_prompt}]
@@ -341,7 +145,7 @@ async def chat_proxy(req: ChatRequest):
             resp = await client.post(
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers={
-                    "Authorization": f"Bearer {groq_key}",
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
                     "Content-Type": "application/json",
                 },
                 json={
@@ -361,55 +165,7 @@ async def chat_proxy(req: ChatRequest):
         return ChatResponse(reply=f"⚠️  Gateway error: {str(e)}")
 
 
-@app.get("/api/github")
-async def get_github_activity():
-    """Fetch recent public GitHub events for display in the Learning Tracker."""
-    github_user = os.environ.get("GITHUB_USERNAME", "rajkumar")
-    github_token = os.environ.get("GITHUB_TOKEN", "")
-
-    headers = {"Accept": "application/vnd.github.v3+json"}
-    if github_token:
-        headers["Authorization"] = f"Bearer {github_token}"
-
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(
-                f"https://api.github.com/users/{github_user}/events/public?per_page=15",
-                headers=headers,
-            )
-            resp.raise_for_status()
-            events = resp.json()
-
-        commits = []
-        for event in events:
-            if event.get("type") == "PushEvent":
-                repo = event.get("repo", {}).get("name", "unknown")
-                for c in event.get("payload", {}).get("commits", []):
-                    commits.append({
-                        "repo": repo,
-                        "message": c.get("message", "").split("\n")[0][:80],
-                        "sha": c.get("sha", "")[:7],
-                        "date": event.get("created_at", ""),
-                    })
-            elif event.get("type") == "CreateEvent":
-                repo = event.get("repo", {}).get("name", "unknown")
-                ref_type = event.get("payload", {}).get("ref_type", "")
-                commits.append({
-                    "repo": repo,
-                    "message": f"Created {ref_type}",
-                    "sha": "",
-                    "date": event.get("created_at", ""),
-                })
-
-        return {"commits": commits[:20]}
-
-    except Exception:
-        return {"commits": [
-            {"repo": "rajkumar/pygit", "message": "Implement three-way merge", "sha": "a1b2c3d", "date": ""},
-            {"repo": "rajkumar/portfolio", "message": "Add terminal component", "sha": "e4f5g6h", "date": ""},
-            {"repo": "rajkumar/job-scraper", "message": "Fix dedup pipeline", "sha": "i7j8k9l", "date": ""},
-        ]}
-
+# ── /api/health ─────────────────────────────────────────
 
 @app.get("/api/health")
 async def health():
